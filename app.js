@@ -1,71 +1,62 @@
 /* ─────────────────────────────────────────────────────
    Discord Autoposter — app.js
-   Self-contained: no server, no dependencies.
-   Uses Discord User Token (Self-bot) to POST messages
-   directly to https://discord.com/api/v10/channels/:id/messages
+   Frontend ONLY controls the server. All message sending
+   happens server-side (server.js), so autopost keeps
+   running 24/7 even when this website is closed.
    ───────────────────────────────────────────────────── */
 
-const DISCORD_API = 'https://discord.com/api/v10';
-const STORE_KEY   = 'dap_v2_data'; // localStorage key
+const STORE_KEY = 'dap_v2_session'; // localStorage key (only token + user cached)
 
 // ── State ────────────────────────────────────────────
 let state = {
   token: null,
   user: null,         // { id, username, discriminator, avatar }
-  projects: [],       // [{ id, name, channelId, message, delay, running, sent, failed }]
+  projects: [],       // fetched from server
   activeProjectId: null,
 };
 
-// Per-project timer handles (not persisted)
-const timers = {};
+// Per-project stats polling handles (not persisted)
+const pollers = {};
 
-// ── Persistence ──────────────────────────────────────
-function saveState() {
-  const data = {
-    token: state.token,
-    user: state.user,
-    projects: state.projects.map(p => ({ ...p, running: false })), // never persist running=true
-  };
-  localStorage.setItem(STORE_KEY, JSON.stringify(data));
+// ── Session persistence (only token + user, projects live on server) ──
+function saveSession() {
+  localStorage.setItem(STORE_KEY, JSON.stringify({ token: state.token, user: state.user }));
 }
 
-function loadState() {
+function loadSession() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return false;
     const data = JSON.parse(raw);
-    state.token    = data.token    || null;
-    state.user     = data.user     || null;
-    state.projects = data.projects || [];
+    state.token = data.token || null;
+    state.user  = data.user  || null;
     return !!(state.token && state.user);
   } catch { return false; }
 }
 
-// ── Discord API ───────────────────────────────────────
-async function discordFetch(path, method = 'GET', body = null) {
-  const opts = {
-    method,
-    headers: {
-      'Authorization': state.token,
-      'Content-Type': 'application/json',
-    },
-  };
+function clearSession() {
+  localStorage.removeItem(STORE_KEY);
+}
+
+// ── Server API ────────────────────────────────────────
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(DISCORD_API + path, opts);
+  const res = await fetch(path, opts);
   const json = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, json };
 }
 
 async function validateToken(token) {
-  const tempToken = state.token;
-  state.token = token;
-  const { ok, json } = await discordFetch('/users/@me');
-  if (!ok) { state.token = tempToken; return null; }
-  return json; // user object
+  const { ok, json } = await api('/api/auth/validate', 'POST', { token });
+  if (!ok) return null;
+  return json.user; // user object
 }
 
-async function sendMessage(channelId, content) {
-  return discordFetch(`/channels/${channelId}/messages`, 'POST', { content });
+async function fetchProjects() {
+  if (!state.user) return;
+  const { ok, json } = await api(`/api/projects?userId=${encodeURIComponent(state.user.id)}`);
+  if (ok && Array.isArray(json)) state.projects = json;
 }
 
 // ── Toast ─────────────────────────────────────────────
@@ -161,6 +152,9 @@ function renderProjectList() {
 
 // ── Select / Activate Project ─────────────────────────
 function selectProject(id) {
+  // Stop polling any previously active project
+  stopPolling(state.activeProjectId);
+
   state.activeProjectId = id;
   const p = getActiveProject();
   if (!p) return;
@@ -180,6 +174,9 @@ function selectProject(id) {
 
   updateEditorStatus(p);
   updateStats(p);
+
+  // Poll live stats from the server for this project
+  startPolling(id);
 }
 
 function updateEditorStatus(p) {
@@ -214,31 +211,84 @@ function updateStats(p) {
   $('stat-countdown').textContent = '--:--';
 }
 
+// ── Live stats polling (server is the source of truth) ──
+function startPolling(id) {
+  stopPolling(id);
+  const tick = async () => {
+    if (id !== state.activeProjectId) return;
+    const { ok, json } = await api(`/api/projects/${id}/stats`);
+    if (!ok) return;
+
+    const p = state.projects.find(x => x.id === id);
+    if (p) {
+      const wasRunning = p.running;
+      p.running = json.running;
+      p.sent    = json.sent;
+      p.failed  = json.failed;
+      p.lastError = json.lastError;
+
+      $('stat-sent').textContent   = json.sent   || 0;
+      $('stat-failed').textContent = json.failed || 0;
+
+      if (json.running && json.nextSendIn != null) {
+        const m = String(Math.floor(json.nextSendIn / 60)).padStart(2, '0');
+        const s = String(json.nextSendIn % 60).padStart(2, '0');
+        $('stat-countdown').textContent = `${m}:${s}`;
+      } else {
+        $('stat-countdown').textContent = '--:--';
+      }
+
+      if (wasRunning !== p.running) {
+        updateEditorStatus(p);
+        renderProjectList();
+        if (!p.running && wasRunning) {
+          log(json.lastError ? `⏹ Berhenti: ${json.lastError}` : '⏹ Autopost berhenti.', 'warn');
+        }
+      }
+    }
+  };
+  tick();
+  pollers[id] = setInterval(tick, 2000);
+}
+
+function stopPolling(id) {
+  if (id && pollers[id]) { clearInterval(pollers[id]); delete pollers[id]; }
+}
+
 // ── Add Project ───────────────────────────────────────
-function addProject() {
-  const id = 'proj_' + Date.now();
-  const project = { id, name: 'Project Baru', channelId: '', message: '', delay: 5, running: false, sent: 0, failed: 0 };
-  state.projects.push(project);
-  saveState();
+async function addProject() {
+  const { ok, json } = await api('/api/projects', 'POST', {
+    userId: state.user.id,
+    token: state.token,
+    name: 'Project Baru',
+    channelId: '',
+    message: '',
+    delay: 5,
+  });
+  if (!ok) { toast('Gagal membuat project: ' + (json.error || ''), 'error'); return; }
+
+  await fetchProjects();
   renderProjectList();
-  selectProject(id);
+  selectProject(json.id);
 }
 
 // ── Delete Project ────────────────────────────────────
-function deleteProject(id) {
-  stopProject(id);
-  state.projects = state.projects.filter(p => p.id !== id);
+async function deleteProject(id) {
+  stopPolling(id);
+  const { ok } = await api(`/api/projects/${id}`, 'DELETE');
+  if (!ok) { toast('Gagal menghapus project', 'error'); return; }
+
+  await fetchProjects();
   if (state.activeProjectId === id) {
     state.activeProjectId = null;
     $('empty-project').style.display = '';
     $('project-editor').style.display = 'none';
   }
-  saveState();
   renderProjectList();
 }
 
 // ── Save Config ───────────────────────────────────────
-function saveConfig() {
+async function saveConfig() {
   const p = getActiveProject();
   if (!p) return;
 
@@ -251,149 +301,38 @@ function saveConfig() {
   if (!channel) { toast('Channel ID tidak boleh kosong', 'error'); return; }
   if (!message.trim()) { toast('Teks pesan tidak boleh kosong', 'error'); return; }
 
-  p.name      = name;
-  p.channelId = channel;
-  p.message   = message;
-  p.delay     = delay;
+  const { ok, json } = await api(`/api/projects/${p.id}`, 'PUT', {
+    name, channelId: channel, message, delay, token: state.token,
+  });
+  if (!ok) { toast('Gagal menyimpan: ' + (json.error || ''), 'error'); return; }
 
-  saveState();
+  await fetchProjects();
   renderProjectList();
   $('editor-project-name').textContent = name;
   toast('✅ Konfigurasi disimpan!', 'success');
 }
 
-// ── Autopost Logic ────────────────────────────────────
-function startProject(id) {
+// ── Start / Stop Autopost (server-side) ───────────────
+async function startProject(id) {
+  const { ok, json } = await api(`/api/projects/${id}/start`, 'POST');
+  if (!ok) { toast('Gagal memulai: ' + (json.error || ''), 'error'); return; }
+
   const p = state.projects.find(x => x.id === id);
-  if (!p || p.running) return;
-  if (!p.channelId || !p.message) {
-    toast('Simpan konfigurasi channel & pesan dulu!', 'error');
-    return;
-  }
-
-  p.running = true;
-  p.sent    = p.sent    || 0;
-  p.failed  = p.failed  || 0;
-  renderProjectList();
-  updateEditorStatus(p);
-  log(`▶ Memulai autopost ke channel ${p.channelId} (delay: ${p.delay === 0 ? 'Auto' : p.delay + ' menit'})`, 'info');
-
-  scheduleNext(id);
+  if (p) { p.running = true; updateEditorStatus(p); renderProjectList(); }
+  log('▶ Autopost dimulai di server. Website boleh ditutup, pengiriman tetap jalan.', 'success');
+  startPolling(id);
 }
 
-function stopProject(id) {
+async function stopProject(id) {
+  const { ok } = await api(`/api/projects/${id}/stop`, 'POST');
+  if (!ok) { toast('Gagal menghentikan', 'error'); return; }
+
   const p = state.projects.find(x => x.id === id);
-  if (!p) return;
-
-  if (timers[id]) { clearTimeout(timers[id]); delete timers[id]; }
-  p.running = false;
-  saveState();
+  if (p) { p.running = false; if (p.id === state.activeProjectId) updateEditorStatus(p); }
   renderProjectList();
-
-  if (p.id === state.activeProjectId) {
-    updateEditorStatus(p);
+  if (id === state.activeProjectId) {
     $('stat-countdown').textContent = '--:--';
     log('⏹ Autopost dihentikan.', 'warn');
-  }
-}
-
-function scheduleNext(id) {
-  const p = state.projects.find(x => x.id === id);
-  if (!p || !p.running) return;
-
-  const delayMs = p.delay === 0 ? 1500 : p.delay * 60 * 1000;
-
-  // Send immediately first
-  doSend(id);
-
-  // Then schedule recurring
-  function loop() {
-    const proj = state.projects.find(x => x.id === id);
-    if (!proj || !proj.running) return;
-    doSend(id);
-    startCountdown(id, delayMs);
-    timers[id] = setTimeout(loop, delayMs);
-  }
-
-  startCountdown(id, delayMs);
-  timers[id] = setTimeout(loop, delayMs);
-}
-
-async function doSend(id) {
-  const p = state.projects.find(x => x.id === id);
-  if (!p) return;
-
-  const { ok, status, json } = await sendMessage(p.channelId, p.message);
-
-  if (ok) {
-    p.sent = (p.sent || 0) + 1;
-    if (p.id === state.activeProjectId) {
-      $('stat-sent').textContent = p.sent;
-      log(`✅ Pesan terkirim! (total: ${p.sent})`, 'success');
-    }
-  } else {
-    p.failed = (p.failed || 0) + 1;
-    const reason = json.message || `HTTP ${status}`;
-    if (p.id === state.activeProjectId) {
-      $('stat-failed').textContent = p.failed;
-      log(`❌ Gagal kirim: ${reason}`, 'error');
-    }
-
-    // Stop if forbidden/unauthorized
-    if (status === 401 || status === 403) {
-      log('🔒 Token tidak valid atau akses ditolak. Autopost dihentikan.', 'error');
-      stopProject(id);
-      return;
-    }
-  }
-}
-
-// ── Countdown Display ─────────────────────────────────
-let countdownInterval = {};
-
-function startCountdown(id, totalMs) {
-  if (id !== state.activeProjectId) return;
-  if (countdownInterval[id]) clearInterval(countdownInterval[id]);
-
-  let remaining = Math.ceil(totalMs / 1000);
-  const tick = () => {
-    if (remaining <= 0) { clearInterval(countdownInterval[id]); return; }
-    const m = String(Math.floor(remaining / 60)).padStart(2, '0');
-    const s = String(remaining % 60).padStart(2, '0');
-    const el = $('stat-countdown');
-    if (el) el.textContent = `${m}:${s}`;
-    remaining--;
-  };
-  tick();
-  countdownInterval[id] = setInterval(tick, 1000);
-}
-
-// ── Toggle Start/Stop ─────────────────────────────────
-function toggleStartStop() {
-  const p = getActiveProject();
-  if (!p) return;
-
-  // Save current values first
-  const name    = $('cfg-project-name').value.trim();
-  const channel = $('cfg-channel-id').value.trim();
-  const message = $('cfg-message').value;
-  const delay   = parseFloat($('cfg-delay').value) || 0;
-
-  if (!p.running) {
-    if (!name || !channel || !message.trim()) {
-      toast('Lengkapi Nama Project, Channel ID, dan Teks Pesan dulu!', 'error');
-      return;
-    }
-    p.name      = name;
-    p.channelId = channel;
-    p.message   = message;
-    p.delay     = delay;
-    saveState();
-    renderProjectList();
-    $('editor-project-name').textContent = name;
-    startProject(p.id);
-  } else {
-    stopProject(p.id);
   }
 }
 
@@ -405,6 +344,36 @@ function insertEmoji(emoji) {
   ta.value = ta.value.slice(0, start) + emoji + ta.value.slice(end);
   ta.selectionStart = ta.selectionEnd = start + emoji.length;
   ta.focus();
+}
+
+// ── Toggle Start/Stop ─────────────────────────────────
+async function toggleStartStop() {
+  const p = getActiveProject();
+  if (!p) return;
+
+  const name    = $('cfg-project-name').value.trim();
+  const channel = $('cfg-channel-id').value.trim();
+  const message = $('cfg-message').value;
+  const delay   = parseFloat($('cfg-delay').value) || 0;
+
+  if (!p.running) {
+    if (!name || !channel || !message.trim()) {
+      toast('Lengkapi Nama Project, Channel ID, dan Teks Pesan dulu!', 'error');
+      return;
+    }
+    // Save latest config to server first, then start
+    const save = await api(`/api/projects/${p.id}`, 'PUT', {
+      name, channelId: channel, message, delay, token: state.token,
+    });
+    if (!save.ok) { toast('Gagal menyimpan konfigurasi', 'error'); return; }
+
+    await fetchProjects();
+    renderProjectList();
+    $('editor-project-name').textContent = name;
+    await startProject(p.id);
+  } else {
+    await stopProject(p.id);
+  }
 }
 
 // ── Login Flow ────────────────────────────────────────
@@ -434,8 +403,8 @@ $('login-form').addEventListener('submit', async (e) => {
 
   state.token = token;
   state.user  = user;
-  saveState();
-  mountApp();
+  saveSession();
+  await mountApp();
 });
 
 // Toggle token visibility
@@ -455,8 +424,9 @@ $('toggle-token-vis').addEventListener('click', () => {
 });
 
 // ── App Mount ─────────────────────────────────────────
-function mountApp() {
+async function mountApp() {
   setUserChip(state.user);
+  await fetchProjects();
   renderProjectList();
   showScreen('app');
 
@@ -479,21 +449,23 @@ $('clear-log-btn').addEventListener('click', () => {
   $('log-body').innerHTML = '<div class="log-empty">Log dibersihkan.</div>';
 });
 $('logout-btn').addEventListener('click', () => {
-  // Stop all running projects
-  state.projects.forEach(p => stopProject(p.id));
-  state.token    = null;
-  state.user     = null;
-  saveState();
+  // Note: does NOT stop server-side jobs — they keep running 24/7.
+  Object.keys(pollers).forEach(stopPolling);
+  state.token   = null;
+  state.user    = null;
+  state.projects = [];
+  state.activeProjectId = null;
+  clearSession();
   $('token-input').value = '';
   showScreen('login');
-  toast('Logout berhasil.', 'info');
+  toast('Logout berhasil. Autopost yang aktif tetap berjalan di server.', 'info');
 });
 
 // ── Boot ──────────────────────────────────────────────
-(function init() {
-  const loggedIn = loadState();
+(async function init() {
+  const loggedIn = loadSession();
   if (loggedIn) {
-    mountApp();
+    await mountApp();
   } else {
     showScreen('login');
   }
