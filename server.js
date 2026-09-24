@@ -17,7 +17,13 @@ const DISCORD_API = 'https://discord.com/api/v10';
 
 // ── Middleware ─────────────────────────────────────────
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+// Static files (index.html, style.css, app.js) live in the project root
+app.use(express.static(__dirname));
+
+// Explicitly serve the frontend at "/"
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 // ── Data Store (JSON file) ────────────────────────────
 function loadData() {
@@ -275,8 +281,13 @@ app.get('/api/health', (req, res) => {
 });
 
 // ── Start Server ───────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`✅ Discord Autoposter running on port ${PORT}`);
-  console.log(`🌐 Open: http://localhost:${PORT}`);
-  resumeJobs();
-});
+// On Vercel (serverless) we export the app instead of calling listen().
+if (process.env.VERCEL) {
+  module.exports = app;
+} else {
+  app.listen(PORT, () => {
+    console.log(`✅ Discord Autoposter running on port ${PORT}`);
+    console.log(`🌐 Open: http://localhost:${PORT}`);
+    resumeJobs();
+  });
+}
