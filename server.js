@@ -31,13 +31,23 @@ app.get('/', (req, res) => {
 const runningJobs = {};
 
 // ── Discord API Helper ─────────────────────────────────
+function normalizeDiscordToken(value) {
+  const token = String(value || '').trim();
+  if (!token) return '';
+
+  // Discord bot tokens must be sent with the Bot scheme. Keep an already
+  // prefixed token intact so pasting either form works.
+  return /^(Bot|Bearer)\s+/i.test(token) ? token : `Bot ${token}`;
+}
+
 async function discordFetch(token, path, method = 'GET', body = null) {
+  const normalizedToken = normalizeDiscordToken(token);
   const opts = {
     method,
     headers: {
-      'Authorization': token,
+      'Authorization': normalizedToken,
       'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'User-Agent': 'DiscordAutoposter/2.0',
     },
   };
   if (body) opts.body = JSON.stringify(body);
